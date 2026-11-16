@@ -2,11 +2,12 @@ from datetime import datetime
 from aiogram import Router, F
 from aiogram.filters import Filter
 from aiogram.types import Message, CallbackQuery, InlineKeyboardMarkup, InlineKeyboardButton
+
 from config import OWNER_ID
 from utils.validators import extract_username
 from services.tgstat import get_channel_stat
-from services.apify import check_fake_subscribers
 from services.content import is_crypto_channel
+from services.analyzer import analyze_channel_quality
 from database.storage import save_audit, get_previous_audit, get_history
 
 router = Router()
@@ -33,13 +34,6 @@ def _format_delta(prev: dict, current_score: int) -> str:
     prev_date = datetime.fromisoformat(prev["created_at"]).strftime("%d.%m.%Y")
     return f"\n<i>{arrow} С прошлой проверки ({prev_date}): {sign}{diff} баллов</i>"
 
-def _verdict(score: int, warnings: list[str]) -> str:
-    if score >= 70 and not warnings:
-        return "✅ ЧИСТО. Можно покупать рекламу."
-    if score >= 40:
-        return "⚠️ ЕСТЬ СОМНЕНИЯ. Рекомендую проверить вручную."
-    return "❌ НАКРУТКА. Покупку рекламы лучше отменить."
-
 def _build_keyboard(username: str) -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(inline_keyboard=[[
         InlineKeyboardButton(text="🔄 Повторить проверку", callback_data=f"retry:{username}"),
@@ -47,23 +41,35 @@ def _build_keyboard(username: str) -> InlineKeyboardMarkup:
     ]])
 
 async def run_audit(username: str) -> tuple[str, dict | None]:
+    # 1. Получаем статистику
     stat = await get_channel_stat(username)
     if stat.get("error"):
         return f"❌ {stat['error']}", None
+    
+    # 2. Проверяем крипто-тематику
     is_crypto, ratio = await is_crypto_channel(username)
     if not is_crypto:
         return f"⚠️ Канал @{username} не похож на крипто-тематический (крипто-постов: {ratio:.0%}).", None
-    fake = await check_fake_subscribers(username)
-    if fake.get("error"):
-        return f"❌ {fake['error']}", None
-    score = int(fake.get("quality_score") or 0)
-    warnings = fake.get("warnings") or []
-    err = fake.get("err_percent")
-    verdict = _verdict(score, warnings)
+
+    # 3. Запускаем бесплатный анализ качества
+    analysis = analyze_channel_quality(
+        participants=stat["participants"],
+        avg_reach=stat["avg_post_reach"],
+        err_percent=stat["err_percent"]
+    )
+
+    score = analysis["score"]
+    warnings = analysis["warnings"]
+    verdict = analysis["verdict"]
+    err = analysis["err_percent"]
+
+    # 4. Сравнение с прошлой проверкой
     prev = get_previous_audit(username)
     delta_text = _format_delta(prev, score)
+
     warnings_text = "\n".join(f"• {w}" for w in warnings) if warnings else "Нет"
     err_text = f"{err:.2f}%" if isinstance(err, (int, float)) else "—"
+
     text = (
         f"<b>📊 Аудит канала @{username}</b>\n\n"
         f"<b>Название:</b> {stat['title']}\n"
@@ -71,15 +77,20 @@ async def run_audit(username: str) -> tuple[str, dict | None]:
         f"<b>Средний охват:</b> {_fmt(stat['avg_post_reach'])}\n"
         f"<b>ERR:</b> {err_text}\n"
         f"<b>Крипто-контент:</b> {ratio:.0%} постов\n\n"
-        f"<b>Оценка качества (Apify):</b> {score}/100{delta_text}\n\n"
+        f"<b>Оценка качества (эвристика):</b> {score}/100{delta_text}\n\n"
         f"<b>Предупреждения:</b>\n{warnings_text}\n\n"
         f"<b>Вердикт:</b> {verdict}"
     )
+
     payload = {
-        "username": username, "title": stat["title"],
-        "participants": stat["participants"], "avg_reach": stat["avg_post_reach"],
-        "quality_score": score, "err_percent": err if isinstance(err, (int, float)) else None,
-        "warnings": warnings, "verdict": verdict,
+        "username": username, 
+        "title": stat["title"],
+        "participants": stat["participants"], 
+        "avg_reach": stat["avg_post_reach"],
+        "quality_score": score, 
+        "err_percent": err if isinstance(err, (int, float)) else None,
+        "warnings": warnings, 
+        "verdict": verdict,
     }
     return text, payload
 
