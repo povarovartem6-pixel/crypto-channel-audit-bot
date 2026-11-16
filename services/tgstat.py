@@ -7,10 +7,16 @@ async def get_channel_stat(username: str) -> dict:
         async with TGStatClient(token=TGSTAT_TOKEN) as client:
             channel = await client.channels.get(channel_id=f"@{username}")
             stat = await client.channels.stat(channel_id=f"@{username}")
+            
+            # В TGStat ERR может называться по-разному в зависимости от версии SDK.
+            # Пытаемся достать его, если нет — ставим None.
+            err = getattr(stat, 'err_percent', None) or getattr(stat, 'err', None)
+            
             return {
                 "title": channel.title,
                 "participants": stat.participants_count,
                 "avg_post_reach": stat.avg_post_reach,
+                "err_percent": err,
                 "error": None,
             }
     except TGStatError as exc:
